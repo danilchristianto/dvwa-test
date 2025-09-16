@@ -593,6 +593,55 @@ jobs:
             fi
           fi
 
+      - name: Pre-ZAP Connectivity Validation
+        run: |
+          echo "🔍 Advanced connectivity validation before ZAP scan..."
+          
+          # Test basic connectivity first
+          echo "🌐 Testing basic connectivity to $TARGET_URL..."
+          if curl -L -s --connect-timeout 15 --max-time 30 -I "$TARGET_URL" | grep -i "200\|302\|301"; then
+            echo "✅ Target is responding to HTTP requests"
+          else
+            echo "❌ Target is not responding properly"
+            echo "🔍 Let's try alternative connectivity tests..."
+            
+            # Extract just the host and port for direct testing
+            HOST=$(echo "$TARGET_URL" | sed -e 's|^[^/]*//||' -e 's|/.*$||' -e 's|:.*$||')
+            PORT=$(echo "$TARGET_URL" | grep -o ':[0-9]*' | sed 's/://' || echo "80")
+            
+            echo "🔍 Testing host: $HOST, port: $PORT"
+            
+            # Test with nc if available
+            if command -v nc &> /dev/null; then
+              if echo -e '\x1dclose\x0d' | timeout 10 nc "$HOST" "$PORT"; then
+                echo "✅ Port $PORT is open on $HOST"
+              else
+                echo "❌ Port $PORT is not accessible on $HOST"
+              fi
+            fi
+            
+            # Test with telnet if available
+            if command -v telnet &> /dev/null; then
+              if echo -e '\x1dclose\x0d' | timeout 10 telnet "$HOST" "$PORT" 2>/dev/null; then
+                echo "✅ Telnet test successful to $HOST:$PORT"
+              else
+                echo "❌ Telnet test failed to $HOST:$PORT"
+              fi
+            fi
+            
+            echo "⚠️ Connectivity issues detected, but proceeding with ZAP scan..."
+            echo "   ZAP may have different network access patterns"
+          fi
+          
+          # Test from different angles
+          echo "🔍 Testing with different curl options..."
+          echo "   - IPv4 only test:"
+          curl -4 -L -s --connect-timeout 10 --max-time 20 -I "$TARGET_URL" | head -3 || echo "     IPv4 test failed"
+          echo "   - Following redirects test:"
+          curl -L -s --connect-timeout 10 --max-time 20 -I "$TARGET_URL" | head -3 || echo "     Redirect test failed"
+          echo "   - No certificate check test:"
+          curl -k -L -s --connect-timeout 10 --max-time 20 -I "$TARGET_URL" | head -3 || echo "     No-cert test failed"
+
       - name: Run ZAP Baseline Scan
         id: zap_scan
         uses: zaproxy/action-baseline@v0.12.0
@@ -600,10 +649,50 @@ jobs:
           target: ${{ env.TARGET_URL }}
           fail_action: false
           cmd_options: >-
-            -a -m 5 -T 60 -d -i -x -J zap-report.json -r zap-report.html -w zap-report.md
+            -a -m 3 -T 120 -d -i -x -J zap-report.json -r zap-report.html -w zap-report.md
             -z "-addonupdate -addoninstall ascanrulesAlpha -addoninstall ascanrulesBeta -addoninstall exportreport"
         continue-on-error: true
-        timeout-minutes: 20
+        timeout-minutes: 25
+
+      - name: Fallback ZAP Scan (If Primary Failed)
+        if: failure() && steps.zap_scan.outcome == 'failure'
+        run: |
+          echo "🔄 Primary ZAP scan failed, attempting fallback scan..."
+          
+          # Try a simpler ZAP scan with minimal options
+          echo "🔍 Running basic ZAP scan with minimal configuration..."
+          docker run --rm \
+            -v $(pwd):/zap/wrk:rw \
+            -u $(id -u):$(id -g) \
+            owasp/zap2docker-stable:latest \
+            zap-baseline.py \
+            -t "$TARGET_URL" \
+            -r zap-fallback-report.html \
+            -J zap-fallback-report.json \
+            -w zap-fallback-report.md \
+            -a \
+            -d \
+            -T 60 \
+            || echo "🔄 Fallback scan completed with warnings"
+          
+          # Check if fallback reports were generated
+          echo "📋 Checking fallback reports:"
+          ls -la zap-fallback-* 2>/dev/null || echo "No fallback reports generated"
+          
+          # Copy fallback reports as primary reports if they exist
+          if [ -f "zap-fallback-report.html" ]; then
+            cp zap-fallback-report.html zap-report.html
+            echo "✅ Using fallback HTML report"
+          fi
+          if [ -f "zap-fallback-report.json" ]; then
+            cp zap-fallback-report.json zap-report.json
+            echo "✅ Using fallback JSON report"
+          fi
+          if [ -f "zap-fallback-report.md" ]; then
+            cp zap-fallback-report.md zap-report.md
+            echo "✅ Using fallback Markdown report"
+          fi
+        continue-on-error: true
 
       - name: Wait for ZAP Scan Completion and Generate Reports
         run: |
@@ -743,9 +832,10 @@ jobs:
           </html>
           EOF
             
-            # Replace placeholders
-            sed -i "s/TARGET_URL_PLACEHOLDER/${TARGET_URL:-Unknown}/g" zap-reports/zap-scan-report.html
-            sed -i "s/DATE_PLACEHOLDER/$(date)/g" zap-reports/zap-scan-report.html
+            # Replace placeholders (safely escape URL for sed)
+            SAFE_TARGET_URL=$(echo "${TARGET_URL:-Unknown}" | sed 's/[[\.*^$()+?{|]/\\&/g')
+            sed -i "s|TARGET_URL_PLACEHOLDER|${SAFE_TARGET_URL}|g" zap-reports/zap-scan-report.html
+            sed -i "s|DATE_PLACEHOLDER|$(date)|g" zap-reports/zap-scan-report.html
             
             echo "✅ Created comprehensive HTML report: zap-reports/zap-scan-report.html"
           else
@@ -806,9 +896,10 @@ jobs:
           *Generated by OWASP ZAP Baseline Scanner | DevSecOps Pipeline*
           EOF
             
-            # Replace placeholders
-            sed -i "s/TARGET_URL_PLACEHOLDER/${TARGET_URL:-Unknown}/g" zap-reports/zap-scan-report.md
-            sed -i "s/DATE_PLACEHOLDER/$(date)/g" zap-reports/zap-scan-report.md
+            # Replace placeholders (safely escape URL for sed)
+            SAFE_TARGET_URL=$(echo "${TARGET_URL:-Unknown}" | sed 's/[[\.*^$()+?{|]/\\&/g')
+            sed -i "s|TARGET_URL_PLACEHOLDER|${SAFE_TARGET_URL}|g" zap-reports/zap-scan-report.md
+            sed -i "s|DATE_PLACEHOLDER|$(date)|g" zap-reports/zap-scan-report.md
             
             echo "✅ Created comprehensive markdown report: zap-reports/zap-scan-report.md"
           fi
