@@ -1,4 +1,4 @@
-name: Deploy DVWA to VPS (password)
+name: Deploy to VPS
 
 on:
   push:
@@ -8,84 +8,78 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
+
+    env:
+      # Set defaults; you can also define these in Repository > Settings > Variables
+      DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/srv/dvwa' }}
+      POST_DEPLOY_CMD: ${{ vars.POST_DEPLOY_CMD || '' }}
+
     steps:
+      - name: Checkout
       - uses: actions/checkout@v4
 
-      - name: Install sshpass
-        run: sudo apt-get update && sudo apt-get install -y sshpass
+      - name: Install rsync & ssh client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rsync openssh-client
 
-      # Optional: trust host key (safer than disabling strict checking)
-      - name: Add host key
+      - name: Configure SSH
         env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_PORT: ${{ secrets.VPS_PORT }}
         run: |
-          mkdir -p ~/.ssh
-          ssh-keyscan -p "$VPS_PORT" "$VPS_HOST" >> ~/.ssh/known_hosts
+          install -m 700 -d ~/.ssh
+          printf '%s' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          # Preload host key (avoids StrictHostKeyChecking=no)
+          ssh-keyscan -p "${VPS_PORT:-22}" "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
 
-      - name: Smoke check SSH
-        env:
-          VPS_HOST: ${{ secrets.VPS_HOST }}
-          VPS_PORT: ${{ secrets.VPS_PORT }}
-          VPS_USER: ${{ secrets.VPS_USER }}
-          VPS_PASSWORD: ${{ secrets.VPS_PASSWORD }}
-        run: |
-          SSHPASS="$VPS_PASSWORD" sshpass -e \
-          ssh -p "$VPS_PORT" -o StrictHostKeyChecking=yes \
-          "$VPS_USER@$VPS_HOST" 'echo connected: $(hostname); whoami'
-
-      - name: Rsync repo to server
+      - name: Ensure remote dir & rsync present
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_PORT: ${{ secrets.VPS_PORT }}
           VPS_USER: ${{ secrets.VPS_USER }}
-          VPS_PASSWORD: ${{ secrets.VPS_PASSWORD }}
-          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH || '/srv/dvwa' }}
+          DEPLOY_PATH: ${{ env.DEPLOY_PATH }}
         run: |
-          SSHPASS="$VPS_PASSWORD" sshpass -e \
+          ssh -p "${VPS_PORT:-22}" "$VPS_USER@$VPS_HOST" "\
+            mkdir -p '$DEPLOY_PATH' && \
+            ( command -v rsync >/dev/null 2>&1 || \
+              (sudo apt-get update && sudo apt-get install -y rsync) || \
+              (which yum >/dev/null 2>&1 && sudo yum install -y rsync) || \
+              true )"
+
+      - name: Deploy with rsync
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          DEPLOY_PATH: ${{ env.DEPLOY_PATH }}
+        run: |
           rsync -az --delete \
-            -e "ssh -p $VPS_PORT -o StrictHostKeyChecking=yes" \
+            --exclude '.git' \
+            --exclude '.github' \
+            -e "ssh -p ${VPS_PORT:-22}" \
             ./ "$VPS_USER@$VPS_HOST:$DEPLOY_PATH/"
 
-      - name: Compose up on server
+      - name: Post-deploy (optional)
+        if: always()  # runs, but does nothing if POST_DEPLOY_CMD is empty
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_PORT: ${{ secrets.VPS_PORT }}
           VPS_USER: ${{ secrets.VPS_USER }}
-          VPS_PASSWORD: ${{ secrets.VPS_PASSWORD }}
-          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH || '/srv/dvwa' }}
+          POST_DEPLOY_CMD: ${{ env.POST_DEPLOY_CMD }}
         run: |
-          SSHPASS="$VPS_PASSWORD" sshpass -e \
-          ssh -p "$VPS_PORT" -o StrictHostKeyChecking=yes "$VPS_USER@$VPS_HOST" "
-            set -euxo pipefail
-            mkdir -p '$DEPLOY_PATH'
-            if [ ! -f '$DEPLOY_PATH/docker-compose.yml' ]; then
-              cat >'$DEPLOY_PATH/docker-compose.yml' <<'YML'
-            services:
-              dvwa:
-                image: vulnerables/web-dvwa
-                restart: unless-stopped
-                ports: ['80:80']
-                environment:
-                  PHPIDS_ENABLED: 0
-            YML
-            fi
-            cd '$DEPLOY_PATH'
-            docker compose pull || true
-            docker compose up -d --remove-orphans
-          "
-
-      - name: Health check
-        env:
-          VPS_HOST: ${{ secrets.VPS_HOST }}
-        run: |
-          for i in {1..30}; do
-            if curl -fsS "http://$VPS_HOST:80" | grep -iq dvwa; then
-              echo "DVWA is up"; exit 0
-            fi
-            sleep 2
-          done
-          echo "DVWA health check failed" && exit 1
+          if [ -n "${POST_DEPLOY_CMD:-}" ]; then
+            echo "Running post-deploy command: $POST_DEPLOY_CMD"
+            ssh -p "${VPS_PORT:-22}" "$VPS_USER@$VPS_HOST" "$POST_DEPLOY_CMD"
+          else
+            echo "No POST_DEPLOY_CMD set; skipping."
+          fi
