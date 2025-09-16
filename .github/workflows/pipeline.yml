@@ -447,9 +447,9 @@ jobs:
             -e "sshpass -p '$VPS_PASSWORD' ssh -o ConnectTimeout=30 -p ${VPS_PORT:-22}" \
             ./ "$VPS_USER@$VPS_HOST:$DEPLOY_PATH/"
 
-      - name: Deploy DVWA using Docker Compose
+      - name: Deploy DVWA from Source Code
         run: |
-          echo "🐳 Deploying DVWA using official Docker Compose setup..."
+          echo "🐳 Deploying DVWA from local source code..."
           sshpass -p "$VPS_PASSWORD" ssh -o ConnectTimeout=30 -p "${VPS_PORT:-22}" "$VPS_USER@$VPS_HOST" "\
             cd '$DEPLOY_PATH' && \
             echo '🛑 Comprehensive cleanup of existing services...' && \
@@ -463,18 +463,28 @@ jobs:
             netstat -tlnp | grep :80 || echo 'Port 80 is now available' && \
             echo '📋 Copying default configuration...' && \
             cp config/config.inc.php.dist config/config.inc.php && \
-            echo '🔧 Configuring for external access and official image...' && \
+            echo '🔧 Configuring for external access and LOCAL SOURCE deployment...' && \
             sed -i 's/127.0.0.1:4280:80/0.0.0.0:80:80/' compose.yml && \
-            sed -i 's/pull_policy: build/pull_policy: always/' compose.yml && \
-            echo '📥 Pulling official DVWA image...' && \
-            docker compose pull && \
-            echo '🚀 Starting DVWA services (clean deployment)...' && \
+            echo '🏗️ IMPORTANT: Configuring to use LOCAL SOURCE CODE...' && \
+            sed -i 's/pull_policy: always/pull_policy: build/' compose.yml && \
+            sed -i 's/# volumes:/volumes:/' compose.yml && \
+            sed -i 's/#   - \.\/:\/var\/www\/html/  - .\/:\/var\/www\/html/' compose.yml && \
+            echo '📝 Verifying source code deployment configuration:' && \
+            echo '   compose.yml configuration:' && \
+            grep -A 10 -B 2 'pull_policy\|volumes.*html' compose.yml || echo 'Configuration check failed' && \
+            echo '   Local source files:' && \
+            ls -la login.php index.php setup.php 2>/dev/null || echo 'Source files check' && \
+            echo '🏗️ Building DVWA from source code...' && \
+            docker compose build --no-cache dvwa && \
+            echo '🚀 Starting DVWA services (from local source)...' && \
             docker compose up -d && \
-            echo '✅ DVWA services started successfully' && \
+            echo '✅ DVWA services started from source code!' && \
             echo '📊 Container status:' && \
             docker compose ps && \
             echo '⏳ Waiting for services to be ready...' && \
             sleep 15 && \
+            echo '🔍 Verifying source code is mounted:' && \
+            docker compose exec -T dvwa ls -la /var/www/html/login.php 2>/dev/null || echo 'Could not verify mounted files' && \
             echo '📋 DVWA container logs:' && \
             docker compose logs dvwa --tail 10 && \
             echo '📋 Database container logs:' && \
