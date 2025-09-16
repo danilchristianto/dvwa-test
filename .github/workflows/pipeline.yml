@@ -58,7 +58,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        language: [ 'javascript', 'python' ]   # adjust to your stack
+        language: [ 'javascript', 'python', 'php' ]   # adjust to your stack
     steps:
       - uses: actions/checkout@v4
       - uses: github/codeql-action/init@v3
