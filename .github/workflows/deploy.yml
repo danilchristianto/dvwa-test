@@ -28,18 +28,22 @@ jobs:
       - name: Install rsync & ssh client
         run: |
           sudo apt-get update
-          sudo apt-get install -y rsync openssh-client
+          sudo apt-get install -y rsync openssh-client sshpass
 
       - name: Configure SSH
         env:
-          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_PASSWORD: ${{ secrets.VPS_PASSWORD }}
         run: |
           install -m 700 -d ~/.ssh
-          printf '%s' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          # Preload host key (avoids StrictHostKeyChecking=no)
+          # Disable StrictHostKeyChecking for password auth
+          echo "Host *" > ~/.ssh/config
+          echo "  StrictHostKeyChecking no" >> ~/.ssh/config
+          echo "  UserKnownHostsFile=/dev/null" >> ~/.ssh/config
+          echo "  PasswordAuthentication yes" >> ~/.ssh/config
+          chmod 600 ~/.ssh/config
+          # Preload host key
           ssh-keyscan -p "${VPS_PORT:-22}" "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
 
       - name: Ensure remote dir & rsync present
@@ -47,9 +51,10 @@ jobs:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_PORT: ${{ secrets.VPS_PORT }}
           VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PASSWORD: ${{ secrets.VPS_PASSWORD }}
           DEPLOY_PATH: ${{ env.DEPLOY_PATH }}
         run: |
-          ssh -p "${VPS_PORT:-22}" "$VPS_USER@$VPS_HOST" "\
+          sshpass -p "$VPS_PASSWORD" ssh -p "${VPS_PORT:-22}" "$VPS_USER@$VPS_HOST" "\
             mkdir -p '$DEPLOY_PATH' && \
             ( command -v rsync >/dev/null 2>&1 || \
               (sudo apt-get update && sudo apt-get install -y rsync) || \
@@ -61,12 +66,13 @@ jobs:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_PORT: ${{ secrets.VPS_PORT }}
           VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PASSWORD: ${{ secrets.VPS_PASSWORD }}
           DEPLOY_PATH: ${{ env.DEPLOY_PATH }}
         run: |
           rsync -az --delete \
             --exclude '.git' \
             --exclude '.github' \
-            -e "ssh -p ${VPS_PORT:-22}" \
+            -e "sshpass -p '$VPS_PASSWORD' ssh -p ${VPS_PORT:-22}" \
             ./ "$VPS_USER@$VPS_HOST:$DEPLOY_PATH/"
 
       - name: Post-deploy (optional)
@@ -75,11 +81,12 @@ jobs:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_PORT: ${{ secrets.VPS_PORT }}
           VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PASSWORD: ${{ secrets.VPS_PASSWORD }}
           POST_DEPLOY_CMD: ${{ env.POST_DEPLOY_CMD }}
         run: |
           if [ -n "${POST_DEPLOY_CMD:-}" ]; then
             echo "Running post-deploy command: $POST_DEPLOY_CMD"
-            ssh -p "${VPS_PORT:-22}" "$VPS_USER@$VPS_HOST" "$POST_DEPLOY_CMD"
+            sshpass -p "$VPS_PASSWORD" ssh -p "${VPS_PORT:-22}" "$VPS_USER@$VPS_HOST" "$POST_DEPLOY_CMD"
           else
             echo "No POST_DEPLOY_CMD set; skipping."
           fi
