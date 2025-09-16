@@ -237,6 +237,30 @@ jobs:
               (sudo apt-get update && sudo apt-get install -y rsync) || \
               (which yum >/dev/null 2>&1 && sudo yum install -y rsync) || true )"
 
+      - name: Configure Firewall for HTTP/HTTPS
+        run: |
+          echo "🔥 Configuring firewall to allow HTTP (80) and HTTPS (443)..."
+          sshpass -p "$VPS_PASSWORD" ssh -o ConnectTimeout=30 -p "${VPS_PORT:-22}" "$VPS_USER@$VPS_HOST" "\
+            echo '🔍 Checking current firewall status...' && \
+            ( sudo ufw status 2>/dev/null || echo 'UFW not available, checking iptables...' ) && \
+            echo '' && \
+            echo '🌐 Configuring HTTP (port 80) access...' && \
+            ( sudo ufw allow 80/tcp 2>/dev/null || \
+              sudo iptables -A INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || \
+              echo 'Firewall configuration may require manual setup' ) && \
+            echo '🔒 Configuring HTTPS (port 443) access...' && \
+            ( sudo ufw allow 443/tcp 2>/dev/null || \
+              sudo iptables -A INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null || \
+              echo 'HTTPS firewall configuration may require manual setup' ) && \
+            echo '' && \
+            echo '📊 Current firewall status:' && \
+            ( sudo ufw status verbose 2>/dev/null || \
+              sudo iptables -L INPUT -n | grep -E '(80|443)' || \
+              echo 'Could not verify firewall rules' ) && \
+            echo '' && \
+            echo '🔧 Checking what is listening on HTTP/HTTPS ports:' && \
+            netstat -tlnp | grep -E ':(80|443)' || echo 'No services on HTTP/HTTPS ports yet'"
+
       - name: Rsync deploy
         run: |
           rsync -az --delete \
@@ -255,8 +279,8 @@ jobs:
             docker rm dvwa-app 2>/dev/null || true && \
             echo '🏗️ Building Docker image...' && \
             docker build -t dvwa-app:latest . && \
-            echo '🚀 Starting container on port 80...' && \
-            docker run -d --name dvwa-app -p 80:80 dvwa-app:latest && \
+            echo '🚀 Starting container on ports 80 (HTTP) and 443 (HTTPS)...' && \
+            docker run -d --name dvwa-app -p 80:80 -p 443:443 dvwa-app:latest && \
             echo '✅ Container started successfully' && \
             echo '📊 Container status:' && \
             docker ps | grep dvwa-app && \
@@ -290,7 +314,10 @@ jobs:
             done && \
             echo '' && \
             echo '🌐 Testing external connectivity...' && \
-            curl -I http://localhost/ 2>/dev/null || echo 'External curl failed' && \
+            echo 'HTTP test:' && \
+            curl -I http://localhost/ 2>/dev/null || echo 'HTTP test failed' && \
+            echo 'HTTPS test:' && \
+            curl -k -I https://localhost/ 2>/dev/null || echo 'HTTPS test failed (expected - no SSL cert)' && \
             echo '📊 Final container status:' && \
             docker ps | grep dvwa-app"
 
@@ -314,6 +341,11 @@ jobs:
       VPS_PORT: ${{ secrets.VPS_PORT }}
     steps:
       - name: Prepare ZAP Target URL
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PASSWORD: ${{ secrets.VPS_PASSWORD }}
         run: |
           # Auto-derive target URL from VPS_HOST
           if [ -z "$VPS_HOST" ]; then
@@ -322,41 +354,58 @@ jobs:
             exit 1
           fi
           
-          # Set target URL to VPS IP on port 80
-          TARGET_URL="http://${VPS_HOST}"
-          echo "TARGET_URL=$TARGET_URL" >> $GITHUB_ENV
-          echo "✅ ZAP Target URL auto-derived: $TARGET_URL"
+          # Set target URL to VPS IP on port 80 (try HTTP first)
+          TARGET_URL_HTTP="http://${VPS_HOST}"
+          TARGET_URL_HTTPS="https://${VPS_HOST}"
           
-          # Quick wait since container should already be healthy
-          echo "⏳ Brief wait for deployment to settle (container should be healthy by now)..."
-          sleep 10
+          echo "🌐 Testing both HTTP and HTTPS connectivity..."
           
-          # Test if target is reachable (should work since health check passed)
-          echo "🔍 Testing target reachability..."
-          max_attempts=3
-          attempt=1
-          while [ $attempt -le $max_attempts ]; do
-            echo "🌐 Attempt $attempt/$max_attempts: Testing $TARGET_URL"
-            response=$(curl -s --connect-timeout 10 --max-time 30 -I "$TARGET_URL" 2>&1)
-            if echo "$response" | grep -q "HTTP"; then
-              echo "✅ Target is reachable! Response:"
-              echo "$response" | head -3
-              break
+          # Test HTTP connectivity
+          echo "🔍 Testing HTTP: $TARGET_URL_HTTP"
+          if curl -L -s --connect-timeout 15 --max-time 60 -I "$TARGET_URL_HTTP" >/dev/null 2>&1; then
+            echo "✅ HTTP connectivity successful!"
+            TARGET_URL="$TARGET_URL_HTTP"
+            echo "TARGET_URL=$TARGET_URL" >> $GITHUB_ENV
+            echo "📋 HTTP Response headers:"
+            curl -L -s --connect-timeout 15 --max-time 60 -I "$TARGET_URL_HTTP" 2>/dev/null | head -5 || echo "Could not fetch headers"
+          else
+            echo "⚠️ HTTP connectivity failed, testing HTTPS..."
+            
+            # Test HTTPS connectivity  
+            echo "🔍 Testing HTTPS: $TARGET_URL_HTTPS"
+            if curl -k -L -s --connect-timeout 15 --max-time 60 -I "$TARGET_URL_HTTPS" >/dev/null 2>&1; then
+              echo "✅ HTTPS connectivity successful!"
+              TARGET_URL="$TARGET_URL_HTTPS"
+              echo "TARGET_URL=$TARGET_URL" >> $GITHUB_ENV
+              echo "📋 HTTPS Response headers:"
+              curl -k -L -s --connect-timeout 15 --max-time 60 -I "$TARGET_URL_HTTPS" 2>/dev/null | head -5 || echo "Could not fetch headers"
             else
-              echo "⚠️ Target not reachable yet. Response/Error:"
-              echo "$response" | head -2
-              if [ $attempt -lt $max_attempts ]; then
-                echo "⏳ Waiting 10 seconds before next attempt..."
-                sleep 10
-              fi
-              attempt=$((attempt + 1))
+              echo "❌ Both HTTP and HTTPS connectivity failed"
+              echo "🔧 This could be due to:"
+              echo "   - Firewall blocking external access to ports 80/443"
+              echo "   - VPS network configuration"
+              echo "   - GitHub Actions runner network restrictions"
+              echo ""
+              echo "🧪 Let's verify VPS is accessible via SSH and check internal status..."
+              
+              # Default to HTTP for ZAP scan
+              TARGET_URL="$TARGET_URL_HTTP"
+              echo "TARGET_URL=$TARGET_URL" >> $GITHUB_ENV
+              
+              # Verify the container is actually working from inside VPS
+              sshpass -p "$VPS_PASSWORD" ssh -o ConnectTimeout=15 -p "${VPS_PORT:-22}" "$VPS_USER@$VPS_HOST" "\
+                echo '🔍 Internal connectivity test from VPS:' && \
+                echo 'HTTP test:' && \
+                curl -L -s --max-time 10 -I http://localhost/ | head -3 || echo 'Internal HTTP test failed' && \
+                echo 'HTTPS test:' && \
+                curl -k -L -s --max-time 10 -I https://localhost/ | head -3 || echo 'Internal HTTPS test failed' && \
+                echo '' && \
+                echo '🔧 Checking if ports 80/443 are externally accessible:' && \
+                netstat -tlnp | grep -E ':(80|443)' | grep -v '127.0.0.1' || echo 'Ports not bound to external interface'"
+              
+              echo ""
+              echo "📊 Proceeding with ZAP scan anyway - ZAP may have better network access"
             fi
-          done
-          
-          if [ $attempt -gt $max_attempts ]; then
-            echo "❌ Target not reachable after $max_attempts attempts"
-            echo "🔧 This is unexpected since container health check should have passed"
-            echo "📊 Continuing with scan for debugging..."
           fi
 
       - name: Run ZAP Baseline Scan
@@ -365,8 +414,10 @@ jobs:
           target: ${{ env.TARGET_URL }}
           fail_action: false
           cmd_options: >-
-            -a -m 5 -T 10 -r zap-report.html -w zap-report.md -J zap-report.json -x zap-report.xml
+            -a -m 5 -T 30 -z "-addonupdate -addoninstall ascanrulesAlpha -addoninstall ascanrulesBeta"
+            -r zap-report.html -w zap-report.md -J zap-report.json -x zap-report.xml
         continue-on-error: true
+        timeout-minutes: 15
 
       - name: ZAP Scan Results
         if: always()
