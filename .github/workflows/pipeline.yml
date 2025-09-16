@@ -257,10 +257,42 @@ jobs:
             docker build -t dvwa-app:latest . && \
             echo '🚀 Starting container on port 80...' && \
             docker run -d --name dvwa-app -p 80:80 dvwa-app:latest && \
-            echo '✅ Container deployed successfully' && \
-            echo '⏳ Waiting for application to start...' && \
+            echo '✅ Container started successfully' && \
+            echo '📊 Container status:' && \
+            docker ps | grep dvwa-app && \
+            echo '⏳ Waiting for health check to pass (start-period: 5s)...' && \
             sleep 10 && \
-            docker ps | grep dvwa-app || echo 'Container status check failed'"
+            echo '🔍 Checking container health status...' && \
+            docker inspect dvwa-app --format='{{.State.Health.Status}}' || echo 'No health status yet' && \
+            echo '📋 Container logs:' && \
+            docker logs dvwa-app --tail 15"
+
+      - name: Wait for Container Health
+        run: |
+          echo "🏥 Waiting for container to become healthy..."
+          sshpass -p "$VPS_PASSWORD" ssh -o ConnectTimeout=30 -p "${VPS_PORT:-22}" "$VPS_USER@$VPS_HOST" "\
+            echo '⏳ Waiting for Docker health check to pass...' && \
+            timeout=60 && \
+            elapsed=0 && \
+            while [ \$elapsed -lt \$timeout ]; do \
+              health_status=\$(docker inspect dvwa-app --format='{{.State.Health.Status}}' 2>/dev/null || echo 'none') && \
+              echo \"Health status (\${elapsed}s): \$health_status\" && \
+              if [ \"\$health_status\" = \"healthy\" ]; then \
+                echo '✅ Container is healthy!' && \
+                break; \
+              elif [ \"\$health_status\" = \"unhealthy\" ]; then \
+                echo '❌ Container is unhealthy, checking logs...' && \
+                docker logs dvwa-app --tail 10 && \
+                break; \
+              fi && \
+              sleep 5 && \
+              elapsed=\$((elapsed + 5)); \
+            done && \
+            echo '' && \
+            echo '🌐 Testing external connectivity...' && \
+            curl -I http://localhost/ 2>/dev/null || echo 'External curl failed' && \
+            echo '📊 Final container status:' && \
+            docker ps | grep dvwa-app"
 
       - name: Post-deploy (optional)
         run: |
@@ -295,27 +327,36 @@ jobs:
           echo "TARGET_URL=$TARGET_URL" >> $GITHUB_ENV
           echo "✅ ZAP Target URL auto-derived: $TARGET_URL"
           
-          # Wait for application to be ready
-          echo "⏳ Waiting for application to fully start..."
-          sleep 30
+          # Quick wait since container should already be healthy
+          echo "⏳ Brief wait for deployment to settle (container should be healthy by now)..."
+          sleep 10
           
-          # Test if target is reachable
+          # Test if target is reachable (should work since health check passed)
           echo "🔍 Testing target reachability..."
-          max_attempts=5
+          max_attempts=3
           attempt=1
           while [ $attempt -le $max_attempts ]; do
-            if curl -s --connect-timeout 10 --max-time 30 -I "$TARGET_URL" >/dev/null 2>&1; then
-              echo "✅ Target is reachable (attempt $attempt/$max_attempts)"
+            echo "🌐 Attempt $attempt/$max_attempts: Testing $TARGET_URL"
+            response=$(curl -s --connect-timeout 10 --max-time 30 -I "$TARGET_URL" 2>&1)
+            if echo "$response" | grep -q "HTTP"; then
+              echo "✅ Target is reachable! Response:"
+              echo "$response" | head -3
               break
             else
-              echo "⚠️ Target not reachable yet (attempt $attempt/$max_attempts), waiting..."
-              sleep 15
+              echo "⚠️ Target not reachable yet. Response/Error:"
+              echo "$response" | head -2
+              if [ $attempt -lt $max_attempts ]; then
+                echo "⏳ Waiting 10 seconds before next attempt..."
+                sleep 10
+              fi
               attempt=$((attempt + 1))
             fi
           done
           
           if [ $attempt -gt $max_attempts ]; then
-            echo "⚠️ Target may not be reachable after $max_attempts attempts, but continuing with scan..."
+            echo "❌ Target not reachable after $max_attempts attempts"
+            echo "🔧 This is unexpected since container health check should have passed"
+            echo "📊 Continuing with scan for debugging..."
           fi
 
       - name: Run ZAP Baseline Scan
