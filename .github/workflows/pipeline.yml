@@ -156,18 +156,18 @@ jobs:
           # Copy default config as per documentation
           cp config/config.inc.php.dist config/config.inc.php
           
-          # Modify compose.yml to build from local source for security scanning
-          sed -i 's/pull_policy: always/pull_policy: build/' compose.yml
+          # Ensure we use the official image (not local build since we removed Dockerfile)
+          sed -i 's/pull_policy: build/pull_policy: always/' compose.yml
           
-          # Build the official DVWA image
-          echo "🔨 Building DVWA image from official configuration..."
-          docker compose build dvwa
+          # Pull the official DVWA image
+          echo "📥 Pulling official DVWA image for scanning..."
+          docker compose pull dvwa
           
-          # Tag the built image for scanning
-          docker tag dvwa-test-dvwa:latest dvwa-app:${{ github.sha }}
-          docker tag dvwa-test-dvwa:latest dvwa-app:latest
+          # Tag the official image for scanning
+          docker tag ghcr.io/digininja/dvwa:latest dvwa-app:${{ github.sha }}
+          docker tag ghcr.io/digininja/dvwa:latest dvwa-app:latest
           
-          echo "✅ DVWA image built successfully using official setup"
+          echo "✅ Official DVWA image prepared for security scanning"
 
       - name: Container Security Scan (Trivy)
         uses: aquasecurity/trivy-action@0.24.0
