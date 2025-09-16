@@ -332,6 +332,17 @@ jobs:
             echo '🔧 Checking what is listening on HTTP/HTTPS ports:' && \
             netstat -tlnp | grep -E ':(80|443)' || echo 'No services on HTTP/HTTPS ports yet'"
 
+      - name: Pre-deployment Cleanup
+        run: |
+          echo "🧹 Pre-deployment cleanup on VPS..."
+          sshpass -p "$VPS_PASSWORD" ssh -o ConnectTimeout=30 -p "${VPS_PORT:-22}" "$VPS_USER@$VPS_HOST" "\
+            echo '🔍 Checking for existing DVWA deployments...' && \
+            docker ps -a --filter 'name=dvwa' --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' || echo 'No existing DVWA containers' && \
+            echo '🔍 Checking port 80 usage...' && \
+            netstat -tlnp | grep :80 || echo 'Port 80 is available' && \
+            echo '🛑 Pre-stopping any DVWA services...' && \
+            (cd '$DEPLOY_PATH' && docker compose down --remove-orphans 2>/dev/null) || echo 'No compose services to stop'"
+
       - name: Rsync deploy
         run: |
           rsync -az --delete \
@@ -345,8 +356,15 @@ jobs:
           echo "🐳 Deploying DVWA using official Docker Compose setup..."
           sshpass -p "$VPS_PASSWORD" ssh -o ConnectTimeout=30 -p "${VPS_PORT:-22}" "$VPS_USER@$VPS_HOST" "\
             cd '$DEPLOY_PATH' && \
-            echo '🛑 Stopping existing services...' && \
-            docker compose down 2>/dev/null || true && \
+            echo '🛑 Comprehensive cleanup of existing services...' && \
+            docker compose down --remove-orphans 2>/dev/null || true && \
+            echo '🧹 Stopping any containers using port 80...' && \
+            docker ps --filter 'publish=80' --quiet | xargs -r docker stop 2>/dev/null || true && \
+            docker ps --filter 'publish=80' --quiet | xargs -r docker rm 2>/dev/null || true && \
+            echo '🧹 Cleaning up any DVWA-related containers...' && \
+            docker ps -a --filter 'name=dvwa' --quiet | xargs -r docker rm -f 2>/dev/null || true && \
+            echo '🔍 Checking port 80 availability...' && \
+            netstat -tlnp | grep :80 || echo 'Port 80 is now available' && \
             echo '📋 Copying default configuration...' && \
             cp config/config.inc.php.dist config/config.inc.php && \
             echo '🔧 Configuring for external access and official image...' && \
@@ -354,7 +372,7 @@ jobs:
             sed -i 's/pull_policy: build/pull_policy: always/' compose.yml && \
             echo '📥 Pulling official DVWA image...' && \
             docker compose pull && \
-            echo '🚀 Starting DVWA services (no build)...' && \
+            echo '🚀 Starting DVWA services (clean deployment)...' && \
             docker compose up -d && \
             echo '✅ DVWA services started successfully' && \
             echo '📊 Container status:' && \
