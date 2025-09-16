@@ -103,26 +103,39 @@ jobs:
       VPS_HOST: ${{ secrets.VPS_HOST }}
       VPS_PORT: ${{ secrets.VPS_PORT }}
       VPS_USER: ${{ secrets.VPS_USER }}
+      VPS_PASSWORD: ${{ secrets.VPS_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install rsync & ssh client
+      - name: Install rsync, ssh client & sshpass
         run: |
           sudo apt-get update
-          sudo apt-get install -y rsync openssh-client
+          sudo apt-get install -y rsync openssh-client sshpass
 
       - name: Configure SSH
-        env:
-          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
         run: |
+          # Create SSH directory with proper permissions
           install -m 700 -d ~/.ssh
-          printf '%s' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
+          
+          # Add host to known_hosts (disable host key checking for password auth)
           ssh-keyscan -p "${VPS_PORT:-22}" "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+          
+          # Create SSH config to disable strict host key checking
+          cat << EOF > ~/.ssh/config
+          Host *
+              StrictHostKeyChecking no
+              UserKnownHostsFile /dev/null
+              LogLevel QUIET
+          EOF
+          chmod 600 ~/.ssh/config
+          
+          # Test SSH connection with password
+          echo "Testing SSH connection with password authentication..."
+          sshpass -p "$VPS_PASSWORD" ssh -o ConnectTimeout=10 -p "${VPS_PORT:-22}" "$VPS_USER@$VPS_HOST" "echo 'SSH connection successful'" || echo "SSH test failed - will retry in next step"
 
       - name: Ensure remote dir & rsync present
         run: |
-          ssh -p "${VPS_PORT:-22}" "$VPS_USER@$VPS_HOST" "\
+          sshpass -p "$VPS_PASSWORD" ssh -o ConnectTimeout=30 -p "${VPS_PORT:-22}" "$VPS_USER@$VPS_HOST" "\
             mkdir -p '$DEPLOY_PATH' && \
             ( command -v rsync >/dev/null 2>&1 || \
               (sudo apt-get update && sudo apt-get install -y rsync) || \
@@ -133,14 +146,14 @@ jobs:
           rsync -az --delete \
             --exclude '.git' \
             --exclude '.github' \
-            -e "ssh -p ${VPS_PORT:-22}" \
+            -e "sshpass -p '$VPS_PASSWORD' ssh -o ConnectTimeout=30 -p ${VPS_PORT:-22}" \
             ./ "$VPS_USER@$VPS_HOST:$DEPLOY_PATH/"
 
       - name: Post-deploy (optional)
         run: |
           if [ -n "${POST_DEPLOY_CMD:-}" ]; then
             echo "Running post-deploy: $POST_DEPLOY_CMD"
-            ssh -p "${VPS_PORT:-22}" "$VPS_USER@$VPS_HOST" "$POST_DEPLOY_CMD"
+            sshpass -p "$VPS_PASSWORD" ssh -o ConnectTimeout=30 -p "${VPS_PORT:-22}" "$VPS_USER@$VPS_HOST" "$POST_DEPLOY_CMD"
           else
             echo "No POST_DEPLOY_CMD set; skipping."
           fi
