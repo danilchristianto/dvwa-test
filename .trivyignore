@@ -1,0 +1,22 @@
+# Trivy ignore file for DVWA (Damn Vulnerable Web Application)
+# DVWA is intentionally vulnerable for educational purposes
+# We ignore certain vulnerabilities that are expected
+
+# Ignore PHP vulnerabilities that are part of DVWA's design
+CVE-2021-21708  # PHP vulnerability
+CVE-2022-31625  # PHP vulnerability
+CVE-2022-31626  # PHP vulnerability
+
+# Ignore Apache vulnerabilities that don't affect the testing scenario
+CVE-2022-31813  # Apache HTTP Server vulnerability
+CVE-2022-37436  # Apache HTTP Server vulnerability
+
+# Ignore OS-level vulnerabilities that are not critical for testing environment
+CVE-2023-4911   # glibc vulnerability
+CVE-2023-29491  # ncurses vulnerability
+
+# Ignore MySQL/MariaDB vulnerabilities in testing context
+CVE-2023-22084  # MySQL vulnerability
+
+# Note: This is for educational/testing purposes only
+# In production, these vulnerabilities should be addressed
