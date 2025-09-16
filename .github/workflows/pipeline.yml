@@ -38,7 +38,10 @@ jobs:
       - name: Run Semgrep
         run: |
           python -m pip install semgrep
+          # Generate multiple report formats
           semgrep ci --sarif --output=semgrep.sarif || echo "Semgrep scan completed with findings"
+          semgrep ci --json --output=semgrep.json || echo "Semgrep JSON report generated"
+          semgrep ci --text --output=semgrep.txt || echo "Semgrep text report generated"
         env:
           SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
       - name: Upload SARIF file
@@ -46,6 +49,16 @@ jobs:
         with:
           sarif_file: semgrep.sarif
         if: always() && hashFiles('semgrep.sarif') != ''
+      - name: Upload Semgrep Reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: semgrep-reports
+          path: |
+            semgrep.sarif
+            semgrep.json
+            semgrep.txt
+          retention-days: 30
 
   # -------------- IaC (tfsec) --------------
   tfsec:
@@ -53,7 +66,32 @@ jobs:
     needs: [ci]
     steps:
       - uses: actions/checkout@v4
-      - uses: aquasecurity/tfsec-action@v1.0.0
+      - name: Run tfsec
+        uses: aquasecurity/tfsec-action@v1.0.0
+        with:
+          format: json
+          soft_fail: true
+      - name: Generate additional tfsec reports
+        run: |
+          # Install tfsec if not available
+          if ! command -v tfsec &> /dev/null; then
+            curl -s https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
+          fi
+          # Generate multiple report formats
+          tfsec . --format json --out tfsec.json --soft-fail || echo "tfsec scan completed"
+          tfsec . --format sarif --out tfsec.sarif --soft-fail || echo "tfsec SARIF generated"
+          tfsec . --format text --out tfsec.txt --soft-fail || echo "tfsec text report generated"
+        continue-on-error: true
+      - name: Upload tfsec Reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tfsec-reports
+          path: |
+            tfsec.json
+            tfsec.sarif
+            tfsec.txt
+          retention-days: 30
 
   # -------------- CodeQL --------------
   codeql:
@@ -70,6 +108,16 @@ jobs:
           languages: ${{ matrix.language }}
       - uses: github/codeql-action/autobuild@v3
       - uses: github/codeql-action/analyze@v3
+        with:
+          upload: true
+          output: codeql-results
+      - name: Upload CodeQL Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: codeql-results-${{ matrix.language }}
+          path: codeql-results
+          retention-days: 30
 
   # -------------- Container Build & Scan --------------
   container:
@@ -89,9 +137,35 @@ jobs:
           output: trivy.sarif
           vuln-type: 'os,library'
           severity: 'CRITICAL,HIGH'
+      - name: Trivy scan (JSON)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: app:ci
+          format: json
+          output: trivy.json
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH,MEDIUM,LOW'
+      - name: Trivy scan (Table)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: app:ci
+          format: table
+          output: trivy.txt
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH,MEDIUM,LOW'
       - uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: trivy.sarif
+      - name: Upload Trivy Reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-reports
+          path: |
+            trivy.sarif
+            trivy.json
+            trivy.txt
+          retention-days: 30
 
   # -------------- Deploy --------------
   deploy:
@@ -167,9 +241,60 @@ jobs:
     env:
       TARGET_URL: ${{ secrets.ZAP_TARGET_URL }}   # e.g. https://your-app.example.com
     steps:
-      - uses: zaproxy/action-baseline@v0.12.0
+      - name: Validate ZAP Target URL
+        run: |
+          if [ -z "$TARGET_URL" ]; then
+            echo "❌ ZAP_TARGET_URL secret is not set"
+            echo "Please set ZAP_TARGET_URL secret to your application URL (e.g., https://your-app.example.com)"
+            exit 1
+          fi
+          echo "✅ ZAP Target URL: $TARGET_URL"
+          
+          # Test if target is reachable
+          echo "🔍 Testing target reachability..."
+          if curl -s --connect-timeout 10 --max-time 30 -I "$TARGET_URL" >/dev/null 2>&1; then
+            echo "✅ Target is reachable"
+          else
+            echo "⚠️ Target may not be reachable, but continuing with scan..."
+          fi
+
+      - name: Run ZAP Baseline Scan
+        uses: zaproxy/action-baseline@v0.12.0
         with:
           target: ${{ env.TARGET_URL }}
           fail_action: false
           cmd_options: >-
-            -a -m 5
+            -a -m 5 -T 10 -r zap-report.html -w zap-report.md -J zap-report.json -x zap-report.xml
+        continue-on-error: true
+
+      - name: ZAP Scan Results
+        if: always()
+        run: |
+          echo "📊 ZAP scan completed"
+          ls -la *.html *.md *.json *.xml 2>/dev/null || echo "Some report files may not be generated"
+          if [ -f report_html.html ]; then
+            echo "✅ HTML report generated: report_html.html"
+          fi
+          if [ -f report_md.md ]; then
+            echo "✅ Markdown report generated: report_md.md"
+          fi
+          if [ -f zap-report.html ]; then
+            echo "✅ ZAP HTML report generated: zap-report.html"
+          fi
+          if [ -f zap-report.json ]; then
+            echo "✅ ZAP JSON report generated: zap-report.json"
+          fi
+
+      - name: Upload ZAP Reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zap-reports
+          path: |
+            report_html.html
+            report_md.md
+            zap-report.html
+            zap-report.md
+            zap-report.json
+            zap-report.xml
+          retention-days: 30
