@@ -1,0 +1,158 @@
+name: Pipeline (CI → Security → Deploy → DAST)
+
+on:
+  push:
+    branches: [ "**" ]          # CI & SAST on every branch
+  pull_request:                  # CI & SAST on PRs
+  workflow_dispatch:             # allow manual run
+
+permissions:
+  contents: read
+  security-events: write
+  packages: write
+
+concurrency:
+  group: pipeline-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/srv/dvwa' }}
+  POST_DEPLOY_CMD: ${{ vars.POST_DEPLOY_CMD || '' }}
+
+jobs:
+  # ---------------- CI ----------------
+  ci:
+    name: Unit / Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # TODO: replace with your real build/tests
+      - run: echo "run your tests here"
+
+  # -------------- SAST (Semgrep) --------------
+  semgrep:
+    runs-on: ubuntu-latest
+    needs: [ci]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: returntocorp/semgrep-action@v1
+        with:
+          generateSarif: true
+          publishToken: ${{ secrets.SEMGREP_APP_TOKEN }} # optional
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+
+  # -------------- IaC (tfsec) --------------
+  tfsec:
+    runs-on: ubuntu-latest
+    needs: [ci]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aquasecurity/tfsec-action@v1
+
+  # -------------- CodeQL --------------
+  codeql:
+    runs-on: ubuntu-latest
+    needs: [ci]
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [ 'javascript', 'python' ]   # adjust to your stack
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+      - uses: github/codeql-action/autobuild@v3
+      - uses: github/codeql-action/analyze@v3
+
+  # -------------- Container Build & Scan --------------
+  container:
+    name: Build image & Trivy scan
+    runs-on: ubuntu-latest
+    needs: [semgrep, tfsec, codeql]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t app:ci .
+      - name: Trivy scan (SARIF)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: app:ci
+          format: sarif
+          output: trivy.sarif
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+
+  # -------------- Deploy --------------
+  deploy:
+    name: Deploy to VPS
+    runs-on: ubuntu-latest
+    needs: [container]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    env:
+      VPS_HOST: ${{ secrets.VPS_HOST }}
+      VPS_PORT: ${{ secrets.VPS_PORT }}
+      VPS_USER: ${{ secrets.VPS_USER }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install rsync & ssh client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rsync openssh-client
+
+      - name: Configure SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p "${VPS_PORT:-22}" "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Ensure remote dir & rsync present
+        run: |
+          ssh -p "${VPS_PORT:-22}" "$VPS_USER@$VPS_HOST" "\
+            mkdir -p '$DEPLOY_PATH' && \
+            ( command -v rsync >/dev/null 2>&1 || \
+              (sudo apt-get update && sudo apt-get install -y rsync) || \
+              (which yum >/dev/null 2>&1 && sudo yum install -y rsync) || true )"
+
+      - name: Rsync deploy
+        run: |
+          rsync -az --delete \
+            --exclude '.git' \
+            --exclude '.github' \
+            -e "ssh -p ${VPS_PORT:-22}" \
+            ./ "$VPS_USER@$VPS_HOST:$DEPLOY_PATH/"
+
+      - name: Post-deploy (optional)
+        run: |
+          if [ -n "${POST_DEPLOY_CMD:-}" ]; then
+            echo "Running post-deploy: $POST_DEPLOY_CMD"
+            ssh -p "${VPS_PORT:-22}" "$VPS_USER@$VPS_HOST" "$POST_DEPLOY_CMD"
+          else
+            echo "No POST_DEPLOY_CMD set; skipping."
+          fi
+
+  # -------------- DAST (ZAP) --------------
+  dast:
+    name: ZAP Baseline
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    env:
+      TARGET_URL: ${{ secrets.ZAP_TARGET_URL }}   # e.g. https://your-app.example.com
+    steps:
+      - uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: ${{ env.TARGET_URL }}
+          fail_action: false
+          cmd_options: >-
+            -a -m 5
