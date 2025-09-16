@@ -1,0 +1,9 @@
+# /srv/dvwa/docker-compose.yml
+services:
+  dvwa:
+    image: vulnerables/web-dvwa
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    environment:
+      PHPIDS_ENABLED: 0

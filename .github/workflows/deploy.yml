@@ -1,0 +1,91 @@
+name: Deploy DVWA to VPS (password)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install sshpass
+        run: sudo apt-get update && sudo apt-get install -y sshpass
+
+      # Optional: trust host key (safer than disabling strict checking)
+      - name: Add host key
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -p "$VPS_PORT" "$VPS_HOST" >> ~/.ssh/known_hosts
+
+      - name: Smoke check SSH
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PASSWORD: ${{ secrets.VPS_PASSWORD }}
+        run: |
+          SSHPASS="$VPS_PASSWORD" sshpass -e \
+          ssh -p "$VPS_PORT" -o StrictHostKeyChecking=yes \
+          "$VPS_USER@$VPS_HOST" 'echo connected: $(hostname); whoami'
+
+      - name: Rsync repo to server
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PASSWORD: ${{ secrets.VPS_PASSWORD }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH || '/srv/dvwa' }}
+        run: |
+          SSHPASS="$VPS_PASSWORD" sshpass -e \
+          rsync -az --delete \
+            -e "ssh -p $VPS_PORT -o StrictHostKeyChecking=yes" \
+            ./ "$VPS_USER@$VPS_HOST:$DEPLOY_PATH/"
+
+      - name: Compose up on server
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PASSWORD: ${{ secrets.VPS_PASSWORD }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH || '/srv/dvwa' }}
+        run: |
+          SSHPASS="$VPS_PASSWORD" sshpass -e \
+          ssh -p "$VPS_PORT" -o StrictHostKeyChecking=yes "$VPS_USER@$VPS_HOST" "
+            set -euxo pipefail
+            mkdir -p '$DEPLOY_PATH'
+            if [ ! -f '$DEPLOY_PATH/docker-compose.yml' ]; then
+              cat >'$DEPLOY_PATH/docker-compose.yml' <<'YML'
+            services:
+              dvwa:
+                image: vulnerables/web-dvwa
+                restart: unless-stopped
+                ports: ['80:80']
+                environment:
+                  PHPIDS_ENABLED: 0
+            YML
+            fi
+            cd '$DEPLOY_PATH'
+            docker compose pull || true
+            docker compose up -d --remove-orphans
+          "
+
+      - name: Health check
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+        run: |
+          for i in {1..30}; do
+            if curl -fsS "http://$VPS_HOST:80" | grep -iq dvwa; then
+              echo "DVWA is up"; exit 0
+            fi
+            sleep 2
+          done
+          echo "DVWA health check failed" && exit 1
