@@ -38,10 +38,29 @@ jobs:
       - name: Run Semgrep
         run: |
           python -m pip install semgrep
-          # Generate multiple report formats
-          semgrep ci --sarif --output=semgrep.sarif || echo "Semgrep scan completed with findings"
-          semgrep ci --json --output=semgrep.json || echo "Semgrep JSON report generated"
-          semgrep ci --text --output=semgrep.txt || echo "Semgrep text report generated"
+          
+          # Create reports directory
+          mkdir -p semgrep-reports
+          
+          # Generate SARIF format for GitHub Security tab
+          echo "🔍 Running Semgrep scan for SARIF..."
+          semgrep --config=auto --sarif --output=semgrep-reports/semgrep.sarif . || echo "Semgrep SARIF scan completed"
+          
+          # Generate JSON format for detailed analysis
+          echo "🔍 Running Semgrep scan for JSON..."
+          semgrep --config=auto --json --output=semgrep-reports/semgrep.json . || echo "Semgrep JSON scan completed"
+          
+          # Generate text format for human reading
+          echo "🔍 Running Semgrep scan for text..."
+          semgrep --config=auto --text --output=semgrep-reports/semgrep.txt . || echo "Semgrep text scan completed"
+          
+          # Copy SARIF to root for GitHub Security upload
+          cp semgrep-reports/semgrep.sarif semgrep.sarif 2>/dev/null || echo "SARIF copy failed"
+          
+          # Show what was generated
+          echo "📊 Generated reports:"
+          ls -la semgrep-reports/ || echo "No reports directory found"
+          ls -la semgrep.* 2>/dev/null || echo "No root level reports found"
         env:
           SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
       - name: Upload SARIF file
@@ -55,9 +74,9 @@ jobs:
         with:
           name: semgrep-reports
           path: |
+            semgrep-reports/
             semgrep.sarif
-            semgrep.json
-            semgrep.txt
+          if-no-files-found: warn
           retention-days: 30
 
   # -------------- IaC (tfsec) --------------
@@ -91,6 +110,7 @@ jobs:
             tfsec.json
             tfsec.sarif
             tfsec.txt
+          if-no-files-found: warn
           retention-days: 30
 
   # -------------- CodeQL --------------
@@ -117,6 +137,7 @@ jobs:
         with:
           name: codeql-results-${{ matrix.language }}
           path: codeql-results
+          if-no-files-found: warn
           retention-days: 30
 
   # -------------- Container Build & Scan --------------
@@ -165,6 +186,7 @@ jobs:
             trivy.sarif
             trivy.json
             trivy.txt
+          if-no-files-found: warn
           retention-days: 30
 
   # -------------- Deploy --------------
@@ -223,13 +245,30 @@ jobs:
             -e "sshpass -p '$VPS_PASSWORD' ssh -o ConnectTimeout=30 -p ${VPS_PORT:-22}" \
             ./ "$VPS_USER@$VPS_HOST:$DEPLOY_PATH/"
 
+      - name: Deploy Docker Container
+        run: |
+          echo "🐳 Deploying Docker container on VPS..."
+          sshpass -p "$VPS_PASSWORD" ssh -o ConnectTimeout=30 -p "${VPS_PORT:-22}" "$VPS_USER@$VPS_HOST" "\
+            cd '$DEPLOY_PATH' && \
+            echo '🛑 Stopping existing container if running...' && \
+            docker stop dvwa-app 2>/dev/null || true && \
+            docker rm dvwa-app 2>/dev/null || true && \
+            echo '🏗️ Building Docker image...' && \
+            docker build -t dvwa-app:latest . && \
+            echo '🚀 Starting container on port 80...' && \
+            docker run -d --name dvwa-app -p 80:80 dvwa-app:latest && \
+            echo '✅ Container deployed successfully' && \
+            echo '⏳ Waiting for application to start...' && \
+            sleep 10 && \
+            docker ps | grep dvwa-app || echo 'Container status check failed'"
+
       - name: Post-deploy (optional)
         run: |
           if [ -n "${POST_DEPLOY_CMD:-}" ]; then
             echo "Running post-deploy: $POST_DEPLOY_CMD"
             sshpass -p "$VPS_PASSWORD" ssh -o ConnectTimeout=30 -p "${VPS_PORT:-22}" "$VPS_USER@$VPS_HOST" "$POST_DEPLOY_CMD"
           else
-            echo "No POST_DEPLOY_CMD set; skipping."
+            echo "No additional post-deploy commands set."
           fi
 
   # -------------- DAST (ZAP) --------------
@@ -239,23 +278,44 @@ jobs:
     needs: [deploy]
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
     env:
-      TARGET_URL: ${{ secrets.ZAP_TARGET_URL }}   # e.g. https://your-app.example.com
+      VPS_HOST: ${{ secrets.VPS_HOST }}
+      VPS_PORT: ${{ secrets.VPS_PORT }}
     steps:
-      - name: Validate ZAP Target URL
+      - name: Prepare ZAP Target URL
         run: |
-          if [ -z "$TARGET_URL" ]; then
-            echo "❌ ZAP_TARGET_URL secret is not set"
-            echo "Please set ZAP_TARGET_URL secret to your application URL (e.g., https://your-app.example.com)"
+          # Auto-derive target URL from VPS_HOST
+          if [ -z "$VPS_HOST" ]; then
+            echo "❌ VPS_HOST secret is not set"
+            echo "Please set VPS_HOST secret to your VPS IP address"
             exit 1
           fi
-          echo "✅ ZAP Target URL: $TARGET_URL"
+          
+          # Set target URL to VPS IP on port 80
+          TARGET_URL="http://${VPS_HOST}"
+          echo "TARGET_URL=$TARGET_URL" >> $GITHUB_ENV
+          echo "✅ ZAP Target URL auto-derived: $TARGET_URL"
+          
+          # Wait for application to be ready
+          echo "⏳ Waiting for application to fully start..."
+          sleep 30
           
           # Test if target is reachable
           echo "🔍 Testing target reachability..."
-          if curl -s --connect-timeout 10 --max-time 30 -I "$TARGET_URL" >/dev/null 2>&1; then
-            echo "✅ Target is reachable"
-          else
-            echo "⚠️ Target may not be reachable, but continuing with scan..."
+          max_attempts=5
+          attempt=1
+          while [ $attempt -le $max_attempts ]; do
+            if curl -s --connect-timeout 10 --max-time 30 -I "$TARGET_URL" >/dev/null 2>&1; then
+              echo "✅ Target is reachable (attempt $attempt/$max_attempts)"
+              break
+            else
+              echo "⚠️ Target not reachable yet (attempt $attempt/$max_attempts), waiting..."
+              sleep 15
+              attempt=$((attempt + 1))
+            fi
+          done
+          
+          if [ $attempt -gt $max_attempts ]; then
+            echo "⚠️ Target may not be reachable after $max_attempts attempts, but continuing with scan..."
           fi
 
       - name: Run ZAP Baseline Scan
@@ -297,4 +357,5 @@ jobs:
             zap-report.md
             zap-report.json
             zap-report.xml
+          if-no-files-found: warn
           retention-days: 30
