@@ -349,10 +349,13 @@ jobs:
             docker compose down 2>/dev/null || true && \
             echo '📋 Copying default configuration...' && \
             cp config/config.inc.php.dist config/config.inc.php && \
-            echo '🔧 Configuring for external access (port 4280 → 80)...' && \
+            echo '🔧 Configuring for external access and official image...' && \
             sed -i 's/127.0.0.1:4280:80/0.0.0.0:80:80/' compose.yml && \
-            echo '🏗️ Building and starting DVWA with Docker Compose...' && \
-            docker compose up -d --build && \
+            sed -i 's/pull_policy: build/pull_policy: always/' compose.yml && \
+            echo '📥 Pulling official DVWA image...' && \
+            docker compose pull && \
+            echo '🚀 Starting DVWA services (no build)...' && \
+            docker compose up -d && \
             echo '✅ DVWA services started successfully' && \
             echo '📊 Container status:' && \
             docker compose ps && \
